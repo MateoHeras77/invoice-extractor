@@ -12,7 +12,7 @@ import streamlit as st
 
 import invoice_parser as ip
 
-st.set_page_config(page_title="CPKC Invoice Extractor", page_icon="📦", layout="wide")
+st.set_page_config(page_title="PDF Data Extractor", page_icon="📊", layout="wide")
 
 # Columns shown by default in the (wide) Invoices table.
 CURATED_INVOICE_COLS = [
@@ -93,19 +93,18 @@ def date_range(df: pd.DataFrame) -> str:
 
 # --- Sidebar: upload + display options ----------------------------------------
 with st.sidebar:
-    st.header("📦 CPKC Invoice Extractor")
+    st.header("📊 PDF Data Extractor")
     st.caption(
-        "Convert CPKC PDFs — freight invoices, miscellaneous-charge invoices "
-        "and interest statements — into a structured Excel workbook. The type "
-        "is auto-detected per page, so mixed PDFs are supported."
+        "Extract structured data from PDF documents into an Excel workbook. "
+        "Document types are auto-detected per page, so mixed PDFs are supported."
     )
     uploaded = st.file_uploader(
-        "Invoice PDF(s)", type="pdf", accept_multiple_files=True,
-        help="Any CPKC freight invoice, miscellaneous-charges invoice or interest statement.",
+        "PDF file(s)", type="pdf", accept_multiple_files=True,
+        help="Upload one or more PDF files to process.",
     )
-    show_all_cols = st.checkbox("Show all columns (Invoices)", value=False)
+    show_all_cols = st.checkbox("Show all columns", value=False)
 
-st.title("📦 CPKC / Purolator Freight Invoice Extractor")
+st.title("📊 PDF Data Extractor")
 
 if not uploaded:
     st.info("⬅️ Upload at least one PDF in the sidebar to begin.")
@@ -133,8 +132,8 @@ has_interest = not statements.empty
 
 if not has_freight and not has_interest:
     st.warning(
-        "No CPKC invoices or interest statements were detected. The file(s) may "
-        "use a layout this tool does not support yet."
+        "No supported documents were detected. The file(s) may use a layout this "
+        "tool does not support yet."
     )
     st.stop()
 
@@ -142,10 +141,10 @@ finance = ip.build_financial_summary(invoices, charges) if has_freight else pd.D
 
 # --- Freight invoices section -------------------------------------------------
 if has_freight:
-    st.subheader("Freight & miscellaneous-charge invoices")
+    st.subheader("Documents")
     flagged = int((invoices["parse_warnings"] != "").sum())
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Invoices", len(invoices))
+    c1.metric("Documents", len(invoices))
     c2.metric(f"Total payable ({metric_currency(invoices)})",
               f"{pd.to_numeric(finance['total_payable'], errors='coerce').sum():,.2f}")
     c3.metric("Total fuel surcharge",
@@ -157,14 +156,14 @@ if has_freight:
                f"**{date_range(invoices)}**")
 
     if flagged:
-        st.warning(f"{flagged} invoice(s) have parse warnings — review before trusting the export.")
+        st.warning(f"{flagged} record(s) have parse warnings — review before trusting the export.")
         st.dataframe(
             invoices.loc[invoices["parse_warnings"] != "",
                          ["source_file", "source_page_start", "cpkc_invoice_number", "parse_warnings"]],
             use_container_width=True, hide_index=True,
         )
     else:
-        st.success("All invoices parsed cleanly (charge totals reconcile).")
+        st.success("All records parsed cleanly (totals reconcile).")
 
     t_inv, t_ch, t_fin = st.tabs([
         f"Invoices ({len(invoices)})", f"Charges ({len(charges)})",
