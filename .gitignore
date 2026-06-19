@@ -1,0 +1,26 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# Source invoice PDFs (do not commit confidential documents)
+*.pdf
+
+# Generated outputs (produced by the app / scripts)
+*.xlsx
+*.csv
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
