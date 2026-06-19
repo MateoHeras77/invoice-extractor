@@ -63,10 +63,26 @@ FINANCE_COLUMNS = [
     "total_charges", "total_payable", "tax",
 ]
 
+# --- Interest Statement and Invoice (a DIFFERENT CPKC document type) --------- #
+# One row per statement (header level).
+INTEREST_STMT_COLUMNS = [
+    "source_file", "source_page_start", "source_page_end", "parse_warnings",
+    "cpkc_invoice_number", "account_number", "invoice_date", "due_date",
+    "interest_period", "bill_to_name", "bill_to_address",
+    "currency", "line_count", "total_interest", "total_payable",
+]
+# One row per interest line item (past-due original invoice).
+INTEREST_LINE_COLUMNS = [
+    "cpkc_invoice_number", "line_no", "original_invoice_no", "reference",
+    "waybill_no", "waybill_date", "unit_no", "stcc", "original_due_date",
+    "amount", "days", "interest",
+]
+
 # Labels whose value is the single line immediately following the label line.
 SCALAR_LABELS = {
     "Original Invoice Number": "original_invoice_number",
     "CPKC Invoice Number": "cpkc_invoice_number",
+    "CPR Invoice Number": "cpkc_invoice_number",  # Miscellaneous Charges Invoice
     "Account Number": "account_number",
     "Customer Reference": "customer_reference",
     "Waybill Number": "waybill_number",
@@ -92,6 +108,7 @@ BLOCK_LABELS = {
 # Labels where the value sits on the SAME line, right after the label text.
 INLINE_LABELS = {
     "Load/Order Number": "load_order_number",
+    "Load Number": "load_order_number",  # Miscellaneous Charges Invoice
     "Seal No.:": "seal_no",
     "Terms of Sale Number": "terms_of_sale_number",
     "Purchase Order:": "purchase_order",
@@ -114,7 +131,7 @@ _INLINE_PREFIXES = tuple(INLINE_LABELS) + (
     "Bill of Lading No.:", "Picked Up from", "Delivered to", "Ultimate Consignee:",
 )
 
-_PAGE_FOOTER_RE = re.compile(r"Page\s*(\d+)\s*/\s*(\d+)")
+_PAGE_FOOTER_RE = re.compile(r"Page\s*(\d+)\s*(?:/|of)\s*(\d+)")
 _MONEY_RE = re.compile(r"-?\s?[\d,]+\.\d+")
 _UNIT_RE = re.compile(
     r"^([A-Z]{2,4}\s?\d+)\s+([A-Z])\s+(\d+)\s+(\d+)\s+(.*)$"
@@ -401,23 +418,180 @@ def parse_invoice(inv: _Invoice) -> tuple[dict, list[dict], list[str]]:
 
 
 # --------------------------------------------------------------------------- #
+# Interest Statement parsing
+# --------------------------------------------------------------------------- #
+_INT_STMT_STOP = {
+    "CPKC Invoice Number", "Invoice Date", "Account Number", "Total Payable",
+    "Interest Period", "Due Date", "Remit to / Retourner à:",
+    "Inquiries to / Pour renseignements:",
+}
+# A full interest line: invoice# / reference (may contain spaces) / waybill /
+# date / unit / stcc / due-date / amount / days / interest.
+_INT_ROW_RE = re.compile(
+    r"^(?P<invoice_no>\S+)\s+(?P<reference>.*?)\s+(?P<waybill>\d+)\s+"
+    r"(?P<date>\d{4}/\d{2}/\d{2})\s+(?P<unit>\S+)\s+(?P<stcc>\d+)\s+"
+    r"(?P<due>\d{4}/\d{2}/\d{2})\s+(?P<amount>[\d,]+\.\d{2})\s+"
+    r"(?P<days>\d+)\s+(?P<interest>[\d,]+\.\d{2})$"
+)
+# Just the financial tail (used for irregular rows, e.g. wrapped fee entries).
+_INT_TAIL_RE = re.compile(
+    r"(?P<amount>[\d,]+\.\d{2})\s+(?P<days>\d+)\s+(?P<interest>[\d,]+\.\d{2})$"
+)
+
+
+def detect_doc_type(lines: list[str]) -> str:
+    """Classify a page group as 'interest', 'freight' or 'unknown'."""
+    text = "\n".join(lines)
+    if "Interest Statement and Invoice" in text:
+        return "interest"
+    if "Charge Description" in text or "Freight Invoice" in text:
+        return "freight"
+    return "unknown"
+
+
+def _int_line(inv_no, ref, wb, date, unit, stcc, due, amount, days, interest):
+    return {
+        "original_invoice_no": (inv_no or "").strip(),
+        "reference": (ref or "").strip(),
+        "waybill_no": (wb or "").strip(),
+        "waybill_date": (date or "").strip(),
+        "unit_no": (unit or "").strip(),
+        "stcc": (stcc or "").strip(),
+        "original_due_date": (due or "").strip(),
+        "amount": _to_number(amount),
+        "days": int(days) if days and str(days).isdigit() else None,
+        "interest": _to_number(interest),
+    }
+
+
+def parse_interest_statement(inv: _Invoice):
+    """Parse one Interest Statement page group -> (header, [lines], warnings)."""
+    lines = inv.lines
+    n = len(lines)
+    h = {c: "" for c in INTEREST_STMT_COLUMNS}
+    warnings: list[str] = []
+
+    def val_after(label, off=2):
+        for i, l in enumerate(lines):
+            if l == label and i + off < n:
+                return lines[i + off]
+        return ""
+
+    h["cpkc_invoice_number"] = val_after("CPKC Invoice Number")
+    h["invoice_date"] = val_after("Invoice Date")
+    h["account_number"] = val_after("Account Number")
+    h["due_date"] = val_after("Due Date")
+    h["interest_period"] = val_after("Interest Period")
+    tp_raw = val_after("Total Payable")
+    h["total_payable"] = _to_number(tp_raw)
+    cur_m = re.search(r"\b([A-Z]{3})\b", tp_raw or "")
+    h["currency"] = cur_m.group(1) if cur_m else ""
+
+    # Bill To block: name at +2, address lines until the next known label.
+    for i, l in enumerate(lines):
+        if l == "Bill To":
+            if i + 2 < n:
+                h["bill_to_name"] = lines[i + 2]
+            addr, j = [], i + 3
+            while j < n and lines[j] not in _INT_STMT_STOP:
+                addr.append(lines[j])
+                j += 1
+            h["bill_to_address"] = " | ".join(addr)
+            break
+
+    # Line-item table: rows between the 'Intérêts' column header and 'Total Payable'.
+    line_rows: list[dict] = []
+    in_table = False
+    fragments: list[str] = []
+    for l in lines:
+        if not in_table:
+            if l == "Intérêts":
+                in_table = True
+            continue
+        if l.startswith("Total Payable"):
+            break
+        m = _INT_ROW_RE.match(l)
+        if m:
+            g = m.groupdict()
+            line_rows.append(_int_line(g["invoice_no"], g["reference"], g["waybill"],
+                                       g["date"], g["unit"], g["stcc"], g["due"],
+                                       g["amount"], g["days"], g["interest"]))
+            fragments = []
+            continue
+        t = _INT_TAIL_RE.search(l)
+        if t:
+            head = l[: t.start()].strip()
+            dates = re.findall(r"\d{4}/\d{2}/\d{2}", head)
+            inv_no = "".join(fragments) if fragments else (head.split()[0] if head else "")
+            date = dates[0] if dates else ""
+            due = dates[-1] if len(dates) > 1 else ""
+            line_rows.append(_int_line(inv_no, "", "", date, "", "", due,
+                                       t["amount"], t["days"], t["interest"]))
+            fragments = []
+            continue
+        if l.strip():  # invoice-number fragment wrapped onto its own line
+            fragments.append(l.strip())
+
+    for k, row in enumerate(line_rows, start=1):
+        row["line_no"] = k
+        row["cpkc_invoice_number"] = h["cpkc_invoice_number"]
+
+    h["source_page_start"] = inv.page_start
+    h["source_page_end"] = inv.page_end
+    h["line_count"] = len(line_rows)
+    h["total_interest"] = round(sum(r["interest"] or 0 for r in line_rows), 2)
+
+    if not h["cpkc_invoice_number"]:
+        warnings.append("missing CPKC invoice number")
+    if not line_rows:
+        warnings.append("no interest line items parsed")
+    if h["total_payable"] is not None and line_rows:
+        if abs(h["total_interest"] - h["total_payable"]) > 0.01:
+            warnings.append(
+                f"interest sum {h['total_interest']} != total_payable "
+                f"{h['total_payable']}")
+    h["parse_warnings"] = "; ".join(warnings)
+    return h, line_rows, warnings
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
-def parse_pdf(pdf_bytes: bytes, source_file: str):
-    """Parse a consolidated PDF into (invoices_df, charges_df)."""
+def parse_pdf_full(pdf_bytes: bytes, source_file: str) -> dict:
+    """Parse a PDF, auto-detecting freight invoices vs interest statements.
+
+    Returns a dict of four DataFrames: 'freight_invoices', 'freight_charges',
+    'interest_statements', 'interest_lines'. Unknown groups fall back to the
+    freight parser (its warnings then flag the mismatch).
+    """
     pages = extract_pages(pdf_bytes)
-    invoices = group_invoices(pages)
+    groups = group_invoices(pages)
 
-    inv_rows, charge_rows = [], []
-    for inv in invoices:
-        header, charges, _ = parse_invoice(inv)
-        header["source_file"] = source_file
-        inv_rows.append(header)
-        charge_rows.extend(charges)
+    fi_rows, fc_rows, is_rows, il_rows = [], [], [], []
+    for g in groups:
+        if detect_doc_type(g.lines) == "interest":
+            header, line_rows, _ = parse_interest_statement(g)
+            header["source_file"] = source_file
+            is_rows.append(header)
+            il_rows.extend(line_rows)
+        else:
+            header, charges, _ = parse_invoice(g)
+            header["source_file"] = source_file
+            fi_rows.append(header)
+            fc_rows.extend(charges)
 
-    invoices_df = pd.DataFrame(inv_rows, columns=INVOICE_COLUMNS)
-    charges_df = pd.DataFrame(charge_rows, columns=CHARGE_COLUMNS)
-    return invoices_df, charges_df
+    return {
+        "freight_invoices": pd.DataFrame(fi_rows, columns=INVOICE_COLUMNS),
+        "freight_charges": pd.DataFrame(fc_rows, columns=CHARGE_COLUMNS),
+        "interest_statements": pd.DataFrame(is_rows, columns=INTEREST_STMT_COLUMNS),
+        "interest_lines": pd.DataFrame(il_rows, columns=INTEREST_LINE_COLUMNS),
+    }
+
+
+def parse_pdf(pdf_bytes: bytes, source_file: str):
+    """Backwards-compatible: return only the freight (invoices, charges) frames."""
+    r = parse_pdf_full(pdf_bytes, source_file)
+    return r["freight_invoices"], r["freight_charges"]
 
 
 def build_financial_summary(invoices_df: pd.DataFrame,
@@ -465,22 +639,21 @@ def build_financial_summary(invoices_df: pd.DataFrame,
     return pd.DataFrame(rows, columns=FINANCE_COLUMNS)
 
 
-def build_workbook(invoices_df: pd.DataFrame, charges_df: pd.DataFrame,
-                   finance_df: pd.DataFrame | None = None) -> bytes:
-    """Write all sheets to a styled in-memory .xlsx workbook."""
-    if finance_df is None:
-        finance_df = build_financial_summary(invoices_df, charges_df)
+def build_workbook(sheets) -> bytes:
+    """Write the given sheets to a styled in-memory .xlsx workbook.
+
+    ``sheets`` is an iterable of ``(sheet_name, dataframe)``; empty/None frames
+    are skipped. At least one non-empty sheet is always written.
+    """
+    pairs = [(name, df) for name, df in sheets if df is not None and not df.empty]
+    if not pairs:  # never produce a zero-sheet workbook
+        pairs = [("Sheet1", pd.DataFrame())]
 
     buffer = io.BytesIO()
-    sheets = (
-        ("Invoices", invoices_df),
-        ("Charges", charges_df),
-        ("Financial Summary", finance_df),
-    )
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for sheet_name, df in sheets:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-            ws = writer.sheets[sheet_name]
+        for sheet_name, df in pairs:
+            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+            ws = writer.sheets[sheet_name[:31]]
             ws.freeze_panes = "A2"
             for col_idx, col in enumerate(df.columns, start=1):
                 width = max(

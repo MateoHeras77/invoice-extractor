@@ -1,10 +1,17 @@
 # CPKC / Purolator Freight Invoice Extractor
 
 A small Python + Streamlit tool that turns consolidated PDFs of **CPKC (Canadian
-Pacific Railway) freight invoices billed to Purolator** into a structured Excel
-workbook. Each invoice (2+ pages) is detected, split out, and parsed into a
-per-invoice header row plus per-line charge rows, with traceability back to the
-source file and page numbers.
+Pacific Railway) documents billed to Purolator** into a structured Excel workbook,
+with traceability back to the source file and page numbers.
+
+It auto-detects the document type **per page**, so a single mixed PDF is handled:
+
+- **Freight invoices** — header + per-line charges (`FAK`, `FUEL SURCHARGE`, carbon
+  surcharges, `REDUCTION`).
+- **Miscellaneous-charge invoices** (`CPR Invoice Number`, e.g. detention charges) —
+  folded into the same `Invoices` / `Charges` sheets.
+- **Interest statements** (bilingual *Interest Statement and Invoice*) — their own
+  `Interest Statements` + `Interest Lines` sheets.
 
 ## Setup
 
@@ -31,8 +38,11 @@ workbook**.
 
 - **Extraction** — `pypdfium2` renders the page text. For this invoice template it
   recovers clean word spacing and keeps each field label adjacent to its value.
-- **Splitting** — invoices are grouped using the `Page x/y` footer (not a hardcoded
-  page count), so 1-page or 3+-page invoices also work.
+- **Splitting** — documents are grouped using the `Page x/y` (or `Page x of y`) footer,
+  not a hardcoded page count, so 1-page or 3+-page documents also work.
+- **Detection** — each page group is classified (freight invoice vs interest statement)
+  and routed to the matching parser; unknown layouts fall back to the freight parser
+  and are flagged via `parse_warnings`.
 - **Parsing** — label-anchored, not position-hardcoded, so minor layout shifts
   don't break it. Charge rows are parsed from the right (currency + amounts) so the
   variable description/rate/quantity columns are handled robustly.
@@ -65,10 +75,27 @@ joined with ` | `.
 `cpkc_invoice_number` (foreign key), `line_no`, `charge_description`, `quantity`,
 `weight`, `rate`, `rate_type`, `currency`, `charge`, `exchange_rate`, `total`.
 
+### Sheet `Financial Summary` (one row per freight invoice)
+
+Compact money view: `invoice_amount`, `discount`, `fuel_surcharge`,
+`fuel_surcharge_pct`, `total_charges`, `total_payable`, `tax`, plus traceability.
+
+### Sheets `Interest Statements` / `Interest Lines` (only when present)
+
+- **Interest Statements** — `cpkc_invoice_number`, `account_number`, `invoice_date`,
+  `due_date`, `interest_period`, `bill_to_*`, `line_count`, `total_interest`,
+  `total_payable`, plus traceability.
+- **Interest Lines** — one row per past-due item: `original_invoice_no`, `reference`,
+  `waybill_no`, `waybill_date`, `unit_no`, `stcc`, `original_due_date`, `amount`,
+  `days`, `interest`, keyed to the statement by `cpkc_invoice_number`.
+
+Empty sheets are omitted from the workbook.
+
 ## Assumptions / scope
 
-- Tuned to the CPKC freight-invoice layout in the provided sample (all `CAD`,
-  `No Tax Applied`). Currency and the tax note are captured as fields rather than
-  assumed, so other currencies surface correctly if present.
-- A non-CPKC PDF parses to zero invoices and the app reports that gracefully
-  instead of crashing.
+- Tuned to the CPKC layouts in the provided samples (all `CAD`, `No Tax Applied`).
+  Currency and the tax note are captured as fields rather than assumed.
+- Reconciliation checks: freight `sum(charges) == total_charges`; interest
+  `sum(interest lines) == total_payable`. Mismatches surface in `parse_warnings`.
+- A non-CPKC PDF parses to zero rows and the app reports that gracefully instead of
+  crashing.
